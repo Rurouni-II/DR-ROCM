@@ -97,7 +97,8 @@ html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; color: va
 .stApp { background: var(--paper); }
 code, .mono { font-family: 'IBM Plex Mono', monospace; }
 
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu, footer { visibility: hidden; }
+header[data-testid="stHeader"] { background: transparent; }
 
 /* ── Header band with ECG signature ─────────────────────────────────────── */
 .dr-header {
