@@ -9,6 +9,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -224,8 +225,8 @@ if "last_report" not in st.session_state:
     st.session_state.last_report = None
 if "conversation" not in st.session_state:
     st.session_state.conversation = []
-if "chat_display" not in st.session_state:
-    st.session_state.chat_display = []
+if "turns" not in st.session_state:
+    st.session_state.turns = []
 if "pending_questions" not in st.session_state:
     st.session_state.pending_questions = []
 if "draft_answers" not in st.session_state:
@@ -306,7 +307,10 @@ with st.sidebar:
         st.session_state.history = []
         st.session_state.last_report = None
         st.session_state.conversation = []
-        st.session_state.chat_display = []
+        st.session_state.turns = []
+        st.session_state.pending_questions = []
+        st.session_state.draft_answers = {}
+        st.session_state.open_question = None
         st.rerun()
 
 
@@ -326,14 +330,36 @@ def image_to_data_url(image: Image.Image) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 
+# Recognized fields in a triage reply. Parsing is done by locating these key
+# names wherever they occur — NOT by splitting on newlines — because the model
+# sometimes returns the whole structured reply on a single line, and may also
+# echo trailing template text (e.g. "Patient context: ...") that we want to
+# recognize and discard rather than have it corrupt the last real field.
+FIELD_KEYS = [
+    "image_type",
+    "triage_label",
+    "summary",
+    "findings",
+    "prescription_text",
+    "follow_up_questions",
+    "Patient context",  # echoed template text we want to isolate and drop
+]
+_FIELD_PATTERN = re.compile(
+    r"(?:^|[\s;])(" + "|".join(re.escape(k) for k in FIELD_KEYS) + r")\s*:\s*"
+)
+
+
 def triage_text_to_dict(text: str) -> dict:
+    text = text.strip()
+    matches = list(_FIELD_PATTERN.finditer(text))
     out = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        out[k.strip()] = v.strip()
+    for i, m in enumerate(matches):
+        key = m.group(1)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        value = text[start:end].strip().strip(",").strip()
+        out[key] = value
+    out.pop("Patient context", None)  # echoed template text, not a real field
     if "follow_up_questions" in out:
         out["follow_up_questions"] = [
             q.strip() for q in out["follow_up_questions"].split(",") if q.strip()
@@ -404,146 +430,143 @@ def run_triage(
     return reply, messages
 
 
-# ── Main layout ──────────────────────────────────────────────────────────────
-left, right = st.columns([1, 1.3], gap="large")
+def build_record(report: dict, patient_context: str, elapsed: float) -> dict:
+    """Turn a parsed triage_text_to_dict() result into a display/history record."""
+    return {
+        "id": str(uuid.uuid4())[:8],
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "image_type": report.get("image_type", "unknown"),
+        "triage_label": report.get("triage_label", "unknown").lower(),
+        "summary": report.get("summary", "—"),
+        "findings": report.get("findings", "—"),
+        "prescription_text": report.get("prescription_text", "none"),
+        "follow_up_questions": report.get("follow_up_questions", []),
+        "patient_context": patient_context,
+        "elapsed_seconds": round(elapsed, 1),
+    }
 
-with left:
-    st.markdown('<div class="dr-panel"><h3>Intake</h3>', unsafe_allow_html=True)
-    uploaded = st.file_uploader(
-        "Upload image", type=["png", "jpg", "jpeg", "webp"], label_visibility="collapsed"
-    )
-    if uploaded:
-        st.image(uploaded, use_container_width=True)
-    context = st.text_area(
-        "Patient context (optional)",
-        placeholder="e.g. 45-year-old male, chest pain for 2 days …",
-        height=90,
-    )
-    run = st.button("🔍 Run triage analysis", use_container_width=True, type="primary")
-    st.markdown("</div>", unsafe_allow_html=True)
 
+def render_report_card(record: dict) -> None:
+    """Renders one triage result using the report-card style — used for the
+    initial analysis AND every follow-up answer, so they all look the same."""
+    label = record["triage_label"] if record["triage_label"] in TRIAGE_COLORS else "unknown"
+    color = TRIAGE_COLORS[label]
+    follow_ups = record.get("follow_up_questions") or []
+    follow_up_html = (
+        "".join(f"<div class='field-value'>• {q}</div>" for q in follow_ups)
+        if follow_ups
+        else "<div class='field-value'>—</div>"
+    )
     st.markdown(
-        html_block("""<div class="dr-panel disclaimer">
-        ⚠️ This tool is for <b>triage assistance only</b> and does not constitute a medical
-        diagnosis. Always consult a qualified healthcare professional.
-        </div>"""),
-        unsafe_allow_html=True,
-    )
-
-with right:
-    result_slot = st.container()
-
-    if run:
-        if not uploaded:
-            st.warning("Please upload an image first.")
-        elif not (account_id_input and api_token_input):
-            st.error("Add your Cloudflare account ID and API token in the sidebar to run an analysis.")
-        else:
-            with st.spinner("Analyzing image…"):
-                try:
-                    image = Image.open(uploaded)
-                    t0 = time.time()
-                    raw_text, seed_messages = run_triage(
-                        image,
-                        context,
-                        VISION_MODEL,
-                        account_id_input,
-                        api_token_input,
-                        gateway_id_input or "default",
-                    )
-                    elapsed = time.time() - t0
-                    report = triage_text_to_dict(raw_text)
-
-                    record = {
-                        "id": str(uuid.uuid4())[:8],
-                        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                        "image_type": report.get("image_type", "unknown"),
-                        "triage_label": report.get("triage_label", "unknown").lower(),
-                        "summary": report.get("summary", "—"),
-                        "findings": report.get("findings", "—"),
-                        "prescription_text": report.get("prescription_text", "none"),
-                        "follow_up_questions": report.get("follow_up_questions", []),
-                        "patient_context": context,
-                        "elapsed_seconds": round(elapsed, 1),
-                    }
-                    st.session_state.history.append(record)
-                    st.session_state.last_report = record
-                    st.session_state.conversation = seed_messages
-                    st.session_state.pending_questions = list(record["follow_up_questions"] or [])
-                    st.session_state.draft_answers = {}
-                    st.session_state.open_question = None
-                    st.session_state.chat_display = [
-                        {
-                            "role": "assistant",
-                            "content": (
-                                f"**{TRIAGE_LABELS.get(record['triage_label'], 'UNKNOWN')}** · "
-                                f"{record['summary']}\n\nAsk me anything else about this image, "
-                                f"or answer one of the follow-up questions above."
-                            ),
-                        }
-                    ]
-                    try:
-                        log_record(record)
-                    except Exception:
-                        pass  # local log is best-effort; never block the UI on it
-
-                except Exception as exc:
-                    st.error(f"Analysis failed: {exc}")
-
-    report = st.session_state.last_report
-    with result_slot:
-        if not report:
-            st.markdown(
-                html_block("""<div class="dr-panel" style="text-align:center; color:var(--ink-soft); padding:60px 20px;">
-                Results will appear here once you run an analysis.
-                </div>"""),
-                unsafe_allow_html=True,
-            )
-        else:
-            label = report["triage_label"] if report["triage_label"] in TRIAGE_COLORS else "unknown"
-            color = TRIAGE_COLORS[label]
-            follow_ups = report.get("follow_up_questions") or []
-            follow_up_html = (
-                "".join(f"<div class='field-value'>• {q}</div>" for q in follow_ups)
-                if follow_ups
-                else "<div class='field-value'>—</div>"
-            )
-
-            st.markdown(
-                html_block(f"""
+        html_block(f"""
 <div class="report-card" style="--tcolor:{color};">
     <div class="report-top">
         <span class="triage-chip">{TRIAGE_LABELS.get(label, "UNKNOWN")}</span>
-        <span class="report-meta">{report['image_type']} · {report['elapsed_seconds']}s</span>
+        <span class="report-meta">{record['image_type']} · {record['elapsed_seconds']}s</span>
     </div>
-    <div class="report-summary">{report['summary']}</div>
+    <div class="report-summary">{record['summary']}</div>
 
     <div class="field-label">Findings</div>
-    <div class="field-value">{report['findings']}</div>
+    <div class="field-value">{record['findings']}</div>
 
     <div class="field-label">Prescription text</div>
-    <div class="field-value mono">{report['prescription_text']}</div>
+    <div class="field-value mono">{record['prescription_text']}</div>
 
     <div class="field-label">Follow-up questions</div>
     {follow_up_html}
 
-    <div class="record-id">record · {report['id']} · {report['timestamp']}</div>
+    <div class="record-id">record · {record['id']} · {record['timestamp']}</div>
 </div>
 """),
-                unsafe_allow_html=True,
-            )
+        unsafe_allow_html=True,
+    )
 
-# ── Follow-up conversation ──────────────────────────────────────────────────
+
+# ── Main layout (single column) ─────────────────────────────────────────────
+st.markdown('<div class="dr-panel"><h3>Intake</h3>', unsafe_allow_html=True)
+uploaded = st.file_uploader(
+    "Upload image", type=["png", "jpg", "jpeg", "webp"], label_visibility="collapsed"
+)
+if uploaded:
+    st.image(uploaded, width=320)
+context = st.text_area(
+    "Patient context (optional)",
+    placeholder="e.g. 45-year-old male, chest pain for 2 days …",
+    height=90,
+)
+run = st.button("🔍 Run triage analysis", use_container_width=True, type="primary")
+st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown(
+    html_block("""<div class="dr-panel disclaimer">
+    ⚠️ This tool is for <b>triage assistance only</b> and does not constitute a medical
+    diagnosis. Always consult a qualified healthcare professional.
+    </div>"""),
+    unsafe_allow_html=True,
+)
+
+if run:
+    if not uploaded:
+        st.warning("Please upload an image first.")
+    elif not (account_id_input and api_token_input):
+        st.error("Add your Cloudflare account ID and API token in the sidebar to run an analysis.")
+    else:
+        with st.spinner("Analyzing image…"):
+            try:
+                image = Image.open(uploaded)
+                t0 = time.time()
+                raw_text, seed_messages = run_triage(
+                    image,
+                    context,
+                    VISION_MODEL,
+                    account_id_input,
+                    api_token_input,
+                    gateway_id_input or "default",
+                )
+                elapsed = time.time() - t0
+                report = triage_text_to_dict(raw_text)
+                record = build_record(report, context, elapsed)
+
+                st.session_state.history.append(record)
+                st.session_state.last_report = record
+                st.session_state.conversation = seed_messages
+                st.session_state.turns = [{"kind": "report", "record": record}]
+                st.session_state.pending_questions = list(record["follow_up_questions"] or [])
+                st.session_state.draft_answers = {}
+                st.session_state.open_question = None
+                try:
+                    log_record(record)
+                except Exception:
+                    pass  # local log is best-effort; never block the UI on it
+
+            except Exception as exc:
+                st.error(f"Analysis failed: {exc}")
+
+if "turns" not in st.session_state:
+    st.session_state.turns = []
+
+if not st.session_state.turns:
+    st.markdown(
+        html_block("""<div class="dr-panel" style="text-align:center; color:var(--ink-soft); padding:60px 20px;">
+        Results will appear here once you run an analysis.
+        </div>"""),
+        unsafe_allow_html=True,
+    )
+
+# ── Conversation (report cards + your answers, in order) ───────────────────
+for turn in st.session_state.turns:
+    if turn["kind"] == "report":
+        render_report_card(turn["record"])
+    else:
+        with st.chat_message("user"):
+            st.markdown(turn["content"])
+
 if st.session_state.last_report and st.session_state.get("conversation"):
     st.markdown("### 💬 Continue the conversation")
     st.caption(
         "Click a question below to answer it. Answer as many as you like, then send "
         "them together — the image stays in context for an updated read."
     )
-
-    for turn in st.session_state.chat_display:
-        with st.chat_message(turn["role"]):
-            st.markdown(turn["content"])
 
     # ── Question buttons ────────────────────────────────────────────────────
     if st.session_state.pending_questions:
@@ -585,11 +608,12 @@ if st.session_state.last_report and st.session_state.get("conversation"):
                 combined = "\n\n".join(parts)
 
                 st.session_state.conversation.append({"role": "user", "content": combined})
-                st.session_state.chat_display.append({"role": "user", "content": combined})
+                st.session_state.turns.append({"kind": "user", "content": combined})
                 with st.spinner("Thinking…"):
                     try:
                         # cap history so payload/cost don't grow unbounded
                         messages = st.session_state.conversation[-16:]
+                        t0 = time.time()
                         reply = call_gateway(
                             messages,
                             VISION_MODEL,
@@ -597,18 +621,37 @@ if st.session_state.last_report and st.session_state.get("conversation"):
                             api_token_input,
                             gateway_id_input or "default",
                         )
+                        elapsed = time.time() - t0
                         st.session_state.conversation.append({"role": "assistant", "content": reply})
-                        st.session_state.chat_display.append({"role": "assistant", "content": reply})
-                    except Exception as exc:
-                        st.session_state.chat_display.append(
-                            {"role": "assistant", "content": f"⚠️ Error: {exc}"}
-                        )
 
-                # answered questions drop off the list; anything unanswered stays for later
-                st.session_state.pending_questions = [
-                    q for q in st.session_state.pending_questions
-                    if q not in st.session_state.draft_answers
-                ]
+                        # Follow-up replies come back in the same structured
+                        # format as the first analysis — parse them the same
+                        # way so they render as a report card too.
+                        follow_up_report = triage_text_to_dict(reply)
+                        if "triage_label" in follow_up_report:
+                            new_record = build_record(follow_up_report, context, elapsed)
+                        else:
+                            # model didn't follow the format for some reason —
+                            # fall back to the previous record's fields but keep the raw reply visible
+                            new_record = dict(st.session_state.last_report)
+                            new_record["id"] = str(uuid.uuid4())[:8]
+                            new_record["timestamp"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                            new_record["summary"] = reply.strip()[:200]
+                            new_record["findings"] = reply.strip()
+                            new_record["elapsed_seconds"] = round(elapsed, 1)
+
+                        st.session_state.history.append(new_record)
+                        st.session_state.last_report = new_record
+                        st.session_state.turns.append({"kind": "report", "record": new_record})
+                        st.session_state.pending_questions = list(new_record["follow_up_questions"] or [])
+                        try:
+                            log_record(new_record)
+                        except Exception:
+                            pass
+
+                    except Exception as exc:
+                        st.error(f"Follow-up failed: {exc}")
+
                 st.session_state.draft_answers = {}
                 st.session_state.open_question = None
                 st.rerun()
