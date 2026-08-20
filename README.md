@@ -42,8 +42,22 @@ streamlit run app.py
    CLOUDFLARE_GATEWAY_ID = "default"
    ```
 
-4. Deploy. (You can also paste credentials directly into the sidebar at runtime
-   instead of storing them as secrets — handy for quick demos.)
+4. Deploy. If secrets aren't set, the sidebar falls back to plain (unmasked
+   account ID, masked token) input fields so you can paste credentials in at
+   runtime instead — handy for quick demos.
+
+## Credentials & the sidebar
+
+- If `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are set (env vars or
+  Streamlit secrets), the sidebar just shows **"Cloudflare credentials loaded
+  from server config ✓"** — the actual values are never echoed into a visible
+  or editable widget, so they can't be read off the screen by anyone viewing
+  the app.
+- A collapsed **"Use different credentials for this session"** expander lets
+  you override them for one session without touching the configured secrets;
+  it starts blank.
+- If no credentials are configured at all, the normal input fields appear
+  (account ID plain text, API token masked).
 
 ## Choosing a model
 
@@ -60,6 +74,30 @@ code:
 Swap the `VISION_MODELS` dict in `app.py` to add others from Cloudflare's
 [Workers AI model catalog](https://developers.cloudflare.com/workers-ai/models/)
 (anything tagged "Vision").
+
+## How the triage flow works
+
+1. Upload an image and (optionally) add patient context, then run the
+   analysis. The result renders as a **report card**: image type, triage
+   label, summary, findings, prescription text (if any), and up to three
+   follow-up questions.
+2. Follow-up questions appear as **buttons**, not a free-text chat. Click one
+   to open a text box, write your answer, and save it — the question gets a
+   ✅ and you can open and answer as many others as you like first.
+3. There's also an optional "ask something else" field for anything not
+   covered by the suggested questions.
+4. When ready, click **📤 Send answers to model** — all saved Q/A pairs (plus
+   your custom message, if any) are sent together in a single message, with
+   the image still in context.
+5. The model's reply comes back in the same structured format as the first
+   analysis, so it renders as another report card — with its own fresh set of
+   follow-up question buttons — right below the previous one. Repeat steps
+   2–5 until you're satisfied with the read.
+6. Replies are parsed with a regex-based field extractor (not a strict
+   newline split), since the model doesn't always put each field on its own
+   line. If parsing ever fails to find a recognizable `triage_label`, the app
+   falls back to showing the raw reply text inside the card rather than
+   crashing.
 
 ## Notes on this version
 
