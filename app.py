@@ -226,26 +226,64 @@ if "conversation" not in st.session_state:
     st.session_state.conversation = []
 if "chat_display" not in st.session_state:
     st.session_state.chat_display = []
+if "pending_questions" not in st.session_state:
+    st.session_state.pending_questions = []
+if "draft_answers" not in st.session_state:
+    st.session_state.draft_answers = {}
+if "open_question" not in st.session_state:
+    st.session_state.open_question = None
 
 
 with st.sidebar:
     st.markdown("### Settings")
-    account_id_input = st.text_input(
-        "Cloudflare account ID",
-        value=get_setting("CLOUDFLARE_ACCOUNT_ID"),
-        help="Found on the right side of any zone/dashboard page, or via `wrangler whoami`.",
-    )
-    api_token_input = st.text_input(
-        "Cloudflare API token",
-        value=get_setting("CLOUDFLARE_API_TOKEN"),
-        type="password",
-        help="A token with the 'Workers AI' permission. Create one under My Profile → API Tokens.",
-    )
-    gateway_id_input = st.text_input(
-        "AI Gateway ID",
-        value=get_setting("CLOUDFLARE_GATEWAY_ID") or "default",
-        help="Your gateway's name in the AI Gateway dashboard. 'default' is created automatically.",
-    )
+
+    _cf_account_id = get_setting("CLOUDFLARE_ACCOUNT_ID")
+    _cf_api_token = get_setting("CLOUDFLARE_API_TOKEN")
+    _cf_gateway_id = get_setting("CLOUDFLARE_GATEWAY_ID") or "default"
+
+    if _cf_account_id and _cf_api_token:
+        # Credentials are configured server-side (env vars / st.secrets) — never
+        # echo them back into a visible/editable widget.
+        st.success("Cloudflare credentials loaded from server config ✓")
+        with st.expander("Use different credentials for this session"):
+            _account_override = st.text_input(
+                "Cloudflare account ID",
+                value="",
+                placeholder="Leave blank to use configured account ID",
+            )
+            _token_override = st.text_input(
+                "Cloudflare API token",
+                value="",
+                type="password",
+                placeholder="Leave blank to use configured token",
+            )
+            _gateway_override = st.text_input(
+                "AI Gateway ID",
+                value="",
+                placeholder=f"Leave blank to use '{_cf_gateway_id}'",
+            )
+        account_id_input = _account_override or _cf_account_id
+        api_token_input = _token_override or _cf_api_token
+        gateway_id_input = _gateway_override or _cf_gateway_id
+    else:
+        st.warning("No Cloudflare credentials configured on the server.")
+        account_id_input = st.text_input(
+            "Cloudflare account ID",
+            value="",
+            help="Found on the right side of any zone/dashboard page, or via `wrangler whoami`.",
+        )
+        api_token_input = st.text_input(
+            "Cloudflare API token",
+            value="",
+            type="password",
+            help="A token with the 'Workers AI' permission. Create one under My Profile → API Tokens.",
+        )
+        gateway_id_input = st.text_input(
+            "AI Gateway ID",
+            value="default",
+            help="Your gateway's name in the AI Gateway dashboard. 'default' is created automatically.",
+        )
+
     model_label = st.selectbox("Vision model", list(VISION_MODELS.keys()), index=0)
     VISION_MODEL = VISION_MODELS[model_label]
     st.caption(f"Model ID: `{VISION_MODEL}`")
@@ -431,6 +469,9 @@ with right:
                     st.session_state.history.append(record)
                     st.session_state.last_report = record
                     st.session_state.conversation = seed_messages
+                    st.session_state.pending_questions = list(record["follow_up_questions"] or [])
+                    st.session_state.draft_answers = {}
+                    st.session_state.open_question = None
                     st.session_state.chat_display = [
                         {
                             "role": "assistant",
@@ -496,36 +537,78 @@ with right:
 if st.session_state.last_report and st.session_state.get("conversation"):
     st.markdown("### 💬 Continue the conversation")
     st.caption(
-        "Answers here go back to the model with the image still in context — "
-        "ask it to refine the read, or answer its follow-up questions for an updated take."
+        "Click a question below to answer it. Answer as many as you like, then send "
+        "them together — the image stays in context for an updated read."
     )
 
     for turn in st.session_state.chat_display:
         with st.chat_message(turn["role"]):
             st.markdown(turn["content"])
 
-    user_msg = st.chat_input("Answer a follow-up question, or ask something else…")
-    if user_msg:
-        if not (account_id_input and api_token_input):
-            st.error("Add your Cloudflare account ID and API token in the sidebar to continue.")
-        else:
-            st.session_state.conversation.append({"role": "user", "content": user_msg})
-            st.session_state.chat_display.append({"role": "user", "content": user_msg})
-            with st.spinner("Thinking…"):
-                try:
-                    # cap history so payload/cost don't grow unbounded
-                    messages = st.session_state.conversation[-16:]
-                    reply = call_gateway(
-                        messages,
-                        VISION_MODEL,
-                        account_id_input,
-                        api_token_input,
-                        gateway_id_input or "default",
-                    )
-                    st.session_state.conversation.append({"role": "assistant", "content": reply})
-                    st.session_state.chat_display.append({"role": "assistant", "content": reply})
-                except Exception as exc:
-                    st.session_state.chat_display.append(
-                        {"role": "assistant", "content": f"⚠️ Error: {exc}"}
-                    )
+    # ── Question buttons ────────────────────────────────────────────────────
+    if st.session_state.pending_questions:
+        st.markdown("**Follow-up questions**")
+        for i, q in enumerate(st.session_state.pending_questions):
+            answered = q in st.session_state.draft_answers
+            label = f"✅ {q}" if answered else f"❓ {q}"
+            if st.button(label, key=f"qbtn_{i}", use_container_width=True):
+                st.session_state.open_question = q
+                st.rerun()
+
+    # ── Text box for whichever question is open ─────────────────────────────
+    if st.session_state.open_question:
+        q = st.session_state.open_question
+        st.markdown(f"**Answering:** {q}")
+        answer_text = st.text_area(
+            "Your answer", value=st.session_state.draft_answers.get(q, ""), key="answer_box"
+        )
+        c1, c2 = st.columns(2)
+        if c1.button("💾 Save answer", type="primary", use_container_width=True):
+            if answer_text.strip():
+                st.session_state.draft_answers[q] = answer_text.strip()
+            st.session_state.open_question = None
             st.rerun()
+        if c2.button("Cancel", use_container_width=True):
+            st.session_state.open_question = None
+            st.rerun()
+
+    custom_msg = st.text_input("Or ask something else (optional)", key="custom_followup")
+
+    if st.session_state.draft_answers or custom_msg.strip():
+        if st.button("📤 Send answers to model", type="primary", use_container_width=True):
+            if not (account_id_input and api_token_input):
+                st.error("Add your Cloudflare credentials in the sidebar to continue.")
+            else:
+                parts = [f"Q: {q}\nA: {a}" for q, a in st.session_state.draft_answers.items()]
+                if custom_msg.strip():
+                    parts.append(custom_msg.strip())
+                combined = "\n\n".join(parts)
+
+                st.session_state.conversation.append({"role": "user", "content": combined})
+                st.session_state.chat_display.append({"role": "user", "content": combined})
+                with st.spinner("Thinking…"):
+                    try:
+                        # cap history so payload/cost don't grow unbounded
+                        messages = st.session_state.conversation[-16:]
+                        reply = call_gateway(
+                            messages,
+                            VISION_MODEL,
+                            account_id_input,
+                            api_token_input,
+                            gateway_id_input or "default",
+                        )
+                        st.session_state.conversation.append({"role": "assistant", "content": reply})
+                        st.session_state.chat_display.append({"role": "assistant", "content": reply})
+                    except Exception as exc:
+                        st.session_state.chat_display.append(
+                            {"role": "assistant", "content": f"⚠️ Error: {exc}"}
+                        )
+
+                # answered questions drop off the list; anything unanswered stays for later
+                st.session_state.pending_questions = [
+                    q for q in st.session_state.pending_questions
+                    if q not in st.session_state.draft_answers
+                ]
+                st.session_state.draft_answers = {}
+                st.session_state.open_question = None
+                st.rerun()
