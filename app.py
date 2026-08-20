@@ -18,6 +18,12 @@ import requests
 import streamlit as st
 from PIL import Image
 
+
+def html_block(s: str) -> str:
+    """Strip leading whitespace from every line so Streamlit's Markdown
+    parser doesn't mistake indented HTML for a literal code block."""
+    return "\n".join(line.strip() for line in s.strip("\n").splitlines())
+
 # ── Config ───────────────────────────────────────────────────────────────────
 # Any Workers AI vision model works here. Llama 3.2 11B Vision is the
 # established choice for image reasoning / OCR; Llama 4 Scout is a stronger
@@ -182,7 +188,7 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # ── Header ───────────────────────────────────────────────────────────────────
 st.markdown(
-    """
+    html_block("""
 <div class="dr-header">
     <div class="ecg-wrap">
         <svg viewBox="0 0 500 200" preserveAspectRatio="none">
@@ -195,7 +201,7 @@ st.markdown(
     image type, conservative severity label, key findings, and follow-up questions.</p>
     <span class="badge">TRIAGE ASSISTANCE ONLY · NOT A DIAGNOSIS</span>
 </div>
-""",
+"""),
     unsafe_allow_html=True,
 )
 
@@ -215,6 +221,10 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "last_report" not in st.session_state:
     st.session_state.last_report = None
+if "conversation" not in st.session_state:
+    st.session_state.conversation = []
+if "chat_display" not in st.session_state:
+    st.session_state.chat_display = []
 
 
 with st.sidebar:
@@ -247,15 +257,17 @@ with st.sidebar:
         for rec in reversed(st.session_state.history[-15:]):
             color = TRIAGE_COLORS.get(rec["triage_label"], "#6B7684")
             st.markdown(
-                f"""<div class="hist-row">
+                html_block(f"""<div class="hist-row">
                     <div class="hist-dot" style="background:{color};"></div>
                     <div><b>{rec['image_type']}</b> · {rec['summary'][:48]}</div>
-                </div>""",
+                </div>"""),
                 unsafe_allow_html=True,
             )
     if st.session_state.history and st.button("Clear history", use_container_width=True):
         st.session_state.history = []
         st.session_state.last_report = None
+        st.session_state.conversation = []
+        st.session_state.chat_display = []
         st.rerun()
 
 
@@ -302,6 +314,28 @@ def log_record(record: dict) -> None:
     LOG_PATH.write_text(json.dumps(existing[-500:], indent=2))
 
 
+def call_gateway(
+    messages: list,
+    model: str,
+    account_id: str,
+    api_token: str,
+    gateway_id: str,
+) -> str:
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "cf-aig-gateway-id": gateway_id,
+        "Content-Type": "application/json",
+    }
+    payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 700}
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=90)
+    if not resp.ok:
+        raise RuntimeError(f"Cloudflare AI Gateway error {resp.status_code}: {resp.text[:400]}")
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
 def run_triage(
     image: Image.Image,
     patient_context: str,
@@ -309,38 +343,26 @@ def run_triage(
     account_id: str,
     api_token: str,
     gateway_id: str,
-) -> str:
+) -> tuple[str, list]:
+    """Returns (raw_report_text, initial_messages) — initial_messages seeds the
+    follow-up conversation so the image stays in context for later turns."""
     context_block = f"Patient context: {patient_context}\n" if patient_context.strip() else ""
     prompt = TRIAGE_PROMPT.format(context_block=context_block)
     resized = resize_for_upload(image)
     data_url = image_to_data_url(resized)
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "cf-aig-gateway-id": gateway_id,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ],
-        "temperature": 0.2,
-        "max_tokens": 700,
-    }
-
-    resp = requests.post(url, headers=headers, json=payload, timeout=90)
-    if not resp.ok:
-        raise RuntimeError(f"Cloudflare AI Gateway error {resp.status_code}: {resp.text[:400]}")
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    reply = call_gateway(messages, model, account_id, api_token, gateway_id)
+    messages.append({"role": "assistant", "content": reply})
+    return reply, messages
 
 
 # ── Main layout ──────────────────────────────────────────────────────────────
@@ -362,10 +384,10 @@ with left:
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(
-        """<div class="dr-panel disclaimer">
+        html_block("""<div class="dr-panel disclaimer">
         ⚠️ This tool is for <b>triage assistance only</b> and does not constitute a medical
         diagnosis. Always consult a qualified healthcare professional.
-        </div>""",
+        </div>"""),
         unsafe_allow_html=True,
     )
 
@@ -382,7 +404,7 @@ with right:
                 try:
                     image = Image.open(uploaded)
                     t0 = time.time()
-                    raw_text = run_triage(
+                    raw_text, seed_messages = run_triage(
                         image,
                         context,
                         VISION_MODEL,
@@ -407,6 +429,17 @@ with right:
                     }
                     st.session_state.history.append(record)
                     st.session_state.last_report = record
+                    st.session_state.conversation = seed_messages
+                    st.session_state.chat_display = [
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"**{TRIAGE_LABELS.get(record['triage_label'], 'UNKNOWN')}** · "
+                                f"{record['summary']}\n\nAsk me anything else about this image, "
+                                f"or answer one of the follow-up questions above."
+                            ),
+                        }
+                    ]
                     try:
                         log_record(record)
                     except Exception:
@@ -419,9 +452,9 @@ with right:
     with result_slot:
         if not report:
             st.markdown(
-                """<div class="dr-panel" style="text-align:center; color:var(--ink-soft); padding:60px 20px;">
+                html_block("""<div class="dr-panel" style="text-align:center; color:var(--ink-soft); padding:60px 20px;">
                 Results will appear here once you run an analysis.
-                </div>""",
+                </div>"""),
                 unsafe_allow_html=True,
             )
         else:
@@ -435,7 +468,7 @@ with right:
             )
 
             st.markdown(
-                f"""
+                html_block(f"""
 <div class="report-card" style="--tcolor:{color};">
     <div class="report-top">
         <span class="triage-chip">{TRIAGE_LABELS.get(label, "UNKNOWN")}</span>
@@ -454,6 +487,44 @@ with right:
 
     <div class="record-id">record · {report['id']} · {report['timestamp']}</div>
 </div>
-""",
+"""),
                 unsafe_allow_html=True,
             )
+
+# ── Follow-up conversation ──────────────────────────────────────────────────
+if st.session_state.last_report and st.session_state.get("conversation"):
+    st.markdown("### 💬 Continue the conversation")
+    st.caption(
+        "Answers here go back to the model with the image still in context — "
+        "ask it to refine the read, or answer its follow-up questions for an updated take."
+    )
+
+    for turn in st.session_state.chat_display:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["content"])
+
+    user_msg = st.chat_input("Answer a follow-up question, or ask something else…")
+    if user_msg:
+        if not (account_id_input and api_token_input):
+            st.error("Add your Cloudflare account ID and API token in the sidebar to continue.")
+        else:
+            st.session_state.conversation.append({"role": "user", "content": user_msg})
+            st.session_state.chat_display.append({"role": "user", "content": user_msg})
+            with st.spinner("Thinking…"):
+                try:
+                    # cap history so payload/cost don't grow unbounded
+                    messages = st.session_state.conversation[-16:]
+                    reply = call_gateway(
+                        messages,
+                        VISION_MODEL,
+                        account_id_input,
+                        api_token_input,
+                        gateway_id_input or "default",
+                    )
+                    st.session_state.conversation.append({"role": "assistant", "content": reply})
+                    st.session_state.chat_display.append({"role": "assistant", "content": reply})
+                except Exception as exc:
+                    st.session_state.chat_display.append(
+                        {"role": "assistant", "content": f"⚠️ Error: {exc}"}
+                    )
+            st.rerun()
